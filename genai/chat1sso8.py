@@ -80,7 +80,7 @@ CANIMAGE = ["google.gemini-2.5-flash","google.gemini-2.5-pro","google.gemini-2.5
             "meta.llama-4-maverick-17b-128e-instruct-fp8","meta.llama-4-scout-17b-16e-instruct",
             "xai.grok-4-fast-non-reasoning","xai.grok-4-fast-reasoning","xai.grok-4"]
 
-DEBUG_MODE=True
+DEBUG_MODE=False
 
 # Google認証
 LOGINBTN = "Googleでログイン"
