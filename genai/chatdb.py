@@ -18,9 +18,10 @@ class chatdb:
     retry_count = 5
     sleep_time = 5
 
-    def __init__(self, config, compid ):
+    def __init__(self, config, compid, tablename ):
         self.nosqlcl : oci.nosql.nosql_client.NosqlClient = oci.nosql.nosql_client.NosqlClient(config)
         self.compartmentid = compid
+        self.tablename = tablename
 
     # 索引作成
     def _create_table_index(self ):

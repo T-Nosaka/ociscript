@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import base64
 import oci
 from oci.generative_ai import GenerativeAiClient
@@ -23,8 +24,24 @@ import time
 import pytz
 import hashlib
 import json
+import os
+import re
+from pathlib import Path
 
 from chatdb import chatdb
+from fetchmarkdown import fetchmarkdown
+
+#
+# 定義サンプル
+#
+# .streamlit/secrets.toml
+# [oci]
+# DEBUGMODE="False"
+# CONFIG_PATH="~/.oci/config"
+# CONFIG="DEFAULT"
+# COMPARTMENT_ID="ocid1.compartment.oc1..aaaaaaahogehoge"
+# CHAT_HISTORY_TABLENAME="ChatHistory2"
+#
 
 # テーマの取得
 theme = "dark" if st.config.get_option("theme.base") == "dark" else "light"
@@ -69,32 +86,48 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
+DEBUG_MODE=st.secrets['DEBUGMODE'].upper()=="TRUE"
+OCI_CONFIG_PATH=st.secrets['oci']['CONFIG_PATH']
+OCI_CONFIG=st.secrets['oci']['CONFIG']
+
+
 # OCI認証情報
-config = oci.config.from_file(st.secrets["oci"]["config_path"], st.secrets["oci"]["config_name"])
-COMPARTMENT_ID = st.secrets["oci"]["compartment"]
+config = oci.config.from_file(OCI_CONFIG_PATH, OCI_CONFIG)
+COMPARTMENT_ID = st.secrets['oci']['COMPARTMENT_ID']
 
 #メディア状況
-CANMOVIE = ["google.gemini-2.5-flash","google.gemini-2.5-pro","google.gemini-2.5-flash-lite"]
-CANAUDIO = ["google.gemini-2.5-flash","google.gemini-2.5-pro","google.gemini-2.5-flash-lite"]
+CANMOVIE = ["google.gemini-2.5-flash","google.gemini-2.5-pro","google.gemini-2.5-flash-lite",
+            "openai.gpt-oss-120b","openai.gpt-oss-20b"]
+CANAUDIO = ["google.gemini-2.5-flash","google.gemini-2.5-pro","google.gemini-2.5-flash-lite",
+            "openai.gpt-oss-20b"]
 CANIMAGE = ["google.gemini-2.5-flash","google.gemini-2.5-pro","google.gemini-2.5-flash-lite",
             "meta.llama-4-maverick-17b-128e-instruct-fp8","meta.llama-4-scout-17b-16e-instruct",
             "xai.grok-4-fast-non-reasoning","xai.grok-4-fast-reasoning","xai.grok-4"]
 
-DEBUG_MODE=False
+DEFAULT_MODEL = st.secrets['oci']['DEFAULT_MODEL']
 
+# Microsoft認証
+LOGINBTN_MS = "Microsoftでログイン"
+AUTHSECTION_MS = "microsoft"
 # Google認証
-LOGINBTN = "Googleでログイン"
-AUTHSECTION = "google"
+LOGINBTN_GOOGLE = "Googleでログイン"
+AUTHSECTION_GOOGLE = "google"
+
 # 認証ID識別子
-def AUTHID(user) :
-    return user.get("sub")
+def AUTHID(provider,user) :
+    if provider == AUTHSECTION_MS :
+        #Microsoft認証の場合
+        return user.get("oid")
+    elif provider == AUTHSECTION_GOOGLE :
+        #Google認証の場合
+        return user.get("sub")
+
 # 許可確認する
 def isContain(oid) :
     return True
 
-
 # チャットDB
-db = chatdb(config,COMPARTMENT_ID)
+db = chatdb(config,COMPARTMENT_ID, st.secrets['CHAT_HISTORY_TABLENAME'])
 
 # 動画入力機能有無
 def hasMovieFunction(model:oci.generative_ai.models.Model):
@@ -114,21 +147,8 @@ def hasAudioFunction(model:oci.generative_ai.models.Model):
         return True
     return False
 
-# 最大トークン数
-def getMaxToken( model:oci.generative_ai.models.Model):
-    if model.display_name in ["google.gemini-2.5-flash","google.gemini-2.5-pro","google.gemini-2.5-flash-lite"]:
-        return 65536
-    if model.display_name in ["xai.grok-3","xai.grok-3-fast","xai.grok-3-mini","xai.grok-3-mini-fast"]:
-        return 16000
-    if model.display_name in ["xai.grok-4","xai.grok-code-fast-1"]:
-        return 131000
-    if model.display_name in ["xai.grok-4-fast-non-reasoning","xai.grok-4-fast-reasoning"]:
-        return 256000
-    return 4000
-
 
 # Generative AI クライアントの初期化
-DEFAULT_MODEL = "google.gemini-2.5-flash"
 client = GenerativeAiInferenceClient(config=config)
 generative_ai_client = GenerativeAiClient(config)
 
@@ -142,6 +162,22 @@ def parseDateTime( tm ) :
 # セッションID生成
 def generate_unique_session_id() -> str:
     return hashlib.md5(str(uuid.uuid4()).encode('utf-8')).hexdigest()[:12]
+
+# 最大出力トークン
+def getMaxToken(modelid):
+    match modelid:
+        case "google.gemini-2.5-flash" | "google.gemini-2.5-pro" | "google.gemini-2.5-flash-lite": 
+            return 65535,10000
+        case "meta.llama-4-maverick-17b-128e-instruct-fp8" | "meta.llama-4-scout-17b-16e-instruct": 
+            return 4000,4000
+        case "xai.grok-4-fast-non-reasoning" | "xai.grok-4-fast-reasoning" : 
+            return 256000,10000
+        case "xai.grok-4" : 
+            return 131000,10000
+        case "openai.gpt-oss-120b" | "openai.gpt-oss-20b": 
+            return 16000,10000
+        
+    return 4000,4000
 
 # エキスポート関数群
 def export_as_text(chat_history, session_id, title):
@@ -278,22 +314,38 @@ for model in models.items:
         if "FINE_TUNE" not in model.capabilities :
             if "CHAT" in model.capabilities :
                 available_models.append(model)
-#                print(f"{model.display_name}")
+                print(f"{model.display_name}")
+
+BASE_DIR = Path(__file__).resolve().parent
 
 #タイトル
-st.title("OCI AI Chat")
+st.title("AI Chat V.4.8")
 
-oid=""
+# セッション切れ対策
+st_autorefresh(interval=1000*60*10, limit=None, key="heartbeat")
+
 if DEBUG_MODE:
     oid = "aaaaaaaaa"
 else:
+    
     if not st.user.is_logged_in:
         st.title("ログインしてください")
-        if st.button(LOGINBTN):
-            st.login(AUTHSECTION)
-            st.stop()
+        
+        if 'auth' in st.secrets is not None and 'microsoft' in st.secrets['auth'] is not None :
+            if st.button(LOGINBTN_MS):
+                st.login(AUTHSECTION_MS)
+        if 'auth' in st.secrets is not None and 'google' in st.secrets['auth'] is not None :
+            if st.button(LOGINBTN_GOOGLE):
+                st.login(AUTHSECTION_GOOGLE)
+            
+        oid = "GUEST"
     else:
-        oid = AUTHID(st.user)
+        provider = st.user.get('provider')
+        oid = AUTHID(provider,st.user)
+
+        # ログアウトボタン
+        if st.button("ログアウト"):
+            st.logout()
 
 if 'nosql_table_checked' not in st.session_state:
     db.createtable()
@@ -305,18 +357,23 @@ if 'current_chat_session_id' not in st.session_state:
 if 'messages_loaded_for_session' not in st.session_state:
     st.session_state.messages_loaded_for_session = None
 
-# ログアウトボタン
-if st.button("ログアウト"):
-    st.logout()
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
 
 # 利用可能権限チェック
 if( isContain(oid) == False ) :
     st.write("許可されていません")
 else :
+    #ロゴ
+    st.sidebar.image(os.path.join(BASE_DIR,'logo.gif'))
+    
     if DEBUG_MODE:
         None
     else:
-        st.sidebar.header(f"Login: {st.user.name}")
+        if oid != 'GUEST' and 'name' in st.user:
+            provider = st.user.get('provider')
+            st.sidebar.header(f"{provider}\nLogin: {st.user.name}")
+        
     selected_model = st.sidebar.selectbox(
         "使用するモデルを選択",
         available_models,
@@ -328,11 +385,13 @@ else :
     hasAudio = hasAudioFunction(selected_model)
 
     # max_tokens
+    maxtoken = getMaxToken( selected_model.display_name )
+    
     max_tokens_value = st.sidebar.slider(
         "トークン数上限",
         min_value=1,
-        max_value=getMaxToken(selected_model),
-        value=int(getMaxToken(selected_model)*0.5),
+        max_value=maxtoken[0],
+        value=maxtoken[1],
         step=1,
         key="max_tokens_value",
         help="応答として生成されるトークンの最大値を設定します。"
@@ -341,7 +400,7 @@ else :
     temperature = st.sidebar.slider(
         "創造性",
         min_value=0.0,
-        max_value=2.0,
+        max_value=1.0,
         value=0.7,
         step=0.01,
         key="temperature",
@@ -350,7 +409,9 @@ else :
 
     # 過去履歴構築
     # ユーザーの全セッションIDを取得
-    all_session_ids: list = db.get_user_session_ids(oid)
+    all_session_ids: list = []
+    if oid != 'GUEST' :
+        all_session_ids = db.get_user_session_ids(oid)
     # 新しいセッションを開始するためのオプションを追加
     NEWCHAT = "新しいチャットを開始"
     # 全セッション追加
@@ -362,132 +423,111 @@ else :
         title = item[2]
         options.append([session_id,jst_timestamp,title])
 
-    # サイドバーでセッションを選択
-    selected_session_option = st.sidebar.selectbox(
-        "過去チャットを選択", 
-        options,
-        index=0,
-        format_func = lambda item: f"{item[2]}",
-        key="session_select_box"
-    )
-    session_id = selected_session_option[0]
-    message_timestamp = selected_session_option[1]
-    title = selected_session_option[2]
+    if oid != 'GUEST':
+        
+        #現セッションID探索
+        sessionidx = 0
+        try:
+            sessionidx = [opt[0] for opt in options].index(st.session_state.current_chat_session_id)
+            print(f"インデックス: {sessionidx}")
+        except ValueError:
+            print("見つかりませんでした")
+        
+        # サイドバーでセッションを選択
+        selected_session_option = st.sidebar.selectbox(
+            "過去チャットを選択", 
+            options,
+            index=sessionidx,
+            format_func = lambda item: f"{item[2]}",
+            key="session_select_session"
+        )
+        session_id = selected_session_option[0]
+        message_timestamp = selected_session_option[1]
+        title = selected_session_option[2]
 
-    print(f"{selected_model.display_name}:{selected_model.vendor},[{session_id}:{message_timestamp}:{title}],{st.session_state.current_chat_session_id}")
+        print(f"{selected_model.display_name}:{selected_model.vendor},[{session_id}:{message_timestamp}:{title}],{st.session_state.current_chat_session_id}")
 
-    # 新しいセッションIDが既存のものと異なる場合のみリセット
-    if session_id == "-1":
+        # 新しいセッションIDが既存のものと異なる場合のみリセット
+        if session_id == "-1":
+            if st.session_state.messages_loaded_for_session is None and st.session_state.current_chat_session_id is not None:
+                #新規で継続中
+                st.session_state.messages = db.load_chat_history_for_session(oid, st.session_state.current_chat_session_id)
+            else :
+                st.session_state.current_chat_session_id = generate_unique_session_id()
+                st.session_state.messages = []
+                st.session_state.messages_loaded_for_session = None
+        else:
+            print(f"履歴ロード {session_id}")
+            # 選択された既存のセッションIDをロード
+            if st.session_state.current_chat_session_id != session_id:
+                st.session_state.current_chat_session_id = session_id
+                st.session_state.messages = db.load_chat_history_for_session(oid, st.session_state.current_chat_session_id)
+                st.session_state.messages_loaded_for_session = session_id
+
+        # 選択されたセッション履歴を削除
+        if session_id != "-1":
+            if st.sidebar.button("削除"):
+                db.delete_user_session(oid, st.session_state.current_chat_session_id)
+                st.session_state.current_chat_session_id = None
+                st.session_state.messages = []
+                st.session_state.messages_loaded_for_session = None
+                st.rerun()
+
+        # セッションのリセットボタン
         if st.session_state.messages_loaded_for_session is None and st.session_state.current_chat_session_id is not None:
-            #新規で継続中
-            st.session_state.messages = db.load_chat_history_for_session(oid, st.session_state.current_chat_session_id)
-        else :
-            st.session_state.current_chat_session_id = generate_unique_session_id()
-            st.session_state.messages = []
-            st.session_state.messages_loaded_for_session = None
+            if st.sidebar.button("リセット"):
+                st.session_state.current_chat_session_id = None
+                st.session_state.messages = []
+                st.session_state.messages_loaded_for_session = None
+                st.rerun()
     else:
-        print(f"履歴ロード {session_id}")
-        # 選択された既存のセッションIDをロード
-        if st.session_state.current_chat_session_id != session_id:
-            st.session_state.current_chat_session_id = session_id
-            st.session_state.messages = db.load_chat_history_for_session(oid, st.session_state.current_chat_session_id)
-            st.session_state.messages_loaded_for_session = session_id
-
-    # セッションのリセットボタン
-    if st.session_state.messages_loaded_for_session is None and st.session_state.current_chat_session_id is not None:
+        session_id = "-1"
         if st.sidebar.button("リセット"):
             st.session_state.current_chat_session_id = None
             st.session_state.messages = []
             st.session_state.messages_loaded_for_session = None
             st.rerun()
 
-    # 選択されたセッション履歴を削除
-    if session_id != "-1":
-        if st.sidebar.button("削除"):
-            db.delete_user_session(oid, st.session_state.current_chat_session_id)
-            st.session_state.current_chat_session_id = None
-            st.session_state.messages = []
-            st.session_state.messages_loaded_for_session = None
-            st.rerun()
-
-        # 拡張エキスポート機能
-        st.sidebar.subheader("エクスポート")
+    # 拡張エキスポート機能
+    st.sidebar.subheader("エクスポート")
+    
+    # エクスポート形式選択
+    export_format = st.sidebar.selectbox(
+        "形式選択",
+        ["JSON", "Markdown", "テキスト"],
+        key="export_format"
+    )
+    
+    # 単一セッションのエクスポート
+    if st.sidebar.button("エクスポート準備"):
+        chat_history = db.load_chat_history_for_session(oid, st.session_state.current_chat_session_id)
         
-        # エクスポート形式選択
-        export_format = st.sidebar.selectbox(
-            "形式選択",
-            ["JSON", "Markdown", "テキスト"],
-            key="export_format"
-        )
+        if export_format == "テキスト":
+            content = export_as_text(chat_history, st.session_state.current_chat_session_id, title)
+            filename = f"chat_{st.session_state.current_chat_session_id}.txt"
+            mime_type = "text/plain"
+        elif export_format == "JSON":
+            content = export_as_json(chat_history, st.session_state.current_chat_session_id, title)
+            filename = f"chat_{st.session_state.current_chat_session_id}.json"
+            mime_type = "application/json"
+        elif export_format == "Markdown":
+            content = export_as_markdown(chat_history, st.session_state.current_chat_session_id, title)
+            filename = f"chat_{st.session_state.current_chat_session_id}.md"
+            mime_type = "text/markdown"
         
-        # 単一セッションのエクスポート
-        if st.sidebar.button("エクスポート準備"):
-            chat_history = db.load_chat_history_for_session(oid, st.session_state.current_chat_session_id)
-            
-            if export_format == "テキスト":
-                content = export_as_text(chat_history, st.session_state.current_chat_session_id, title)
-                filename = f"chat_{st.session_state.current_chat_session_id}.txt"
-                mime_type = "text/plain"
-            elif export_format == "JSON":
-                content = export_as_json(chat_history, st.session_state.current_chat_session_id, title)
-                filename = f"chat_{st.session_state.current_chat_session_id}.json"
-                mime_type = "application/json"
-            elif export_format == "Markdown":
-                content = export_as_markdown(chat_history, st.session_state.current_chat_session_id, title)
-                filename = f"chat_{st.session_state.current_chat_session_id}.md"
-                mime_type = "text/markdown"
-            
-            st.sidebar.download_button(
-                label=f"{export_format}形式でダウンロード",
-                data=content,
-                file_name=filename,
-                mime=mime_type
-            )
-    else :
-        st.sidebar.subheader("インポート")
-
-        # ファイルアップローダー
-        uploaded_file = st.sidebar.file_uploader(
-            "JSONファイルを選択",
-            type=['json'],
-            help="エクスポートしたJSONファイルをアップロードしてください"
+        st.sidebar.download_button(
+            label=f"{export_format}形式でダウンロード",
+            data=content,
+            file_name=filename,
+            mime=mime_type
         )
 
-        if uploaded_file is not None:
-            # ファイル内容を読み込み
-            json_content = uploaded_file.read().decode('utf-8')
-            
-            # プレビュー表示
-            with st.sidebar.expander("ファイル内容プレビュー"):
-                try:
-                    preview_data = json.loads(json_content)
-                    st.write(f"**タイトル:** {preview_data.get('title', 'N/A')}")
-                    st.write(f"**セッションID:** {preview_data.get('session_id', 'N/A')}")
-                    st.write(f"**メッセージ数:** {len(preview_data.get('messages', []))}")
-                    
-                    # 形式検証
-                    is_valid, validation_message = validate_json_format(json_content)
-                    if is_valid:
-                        st.success(validation_message)
-                    else:
-                        st.error(validation_message)
-                        
-                except Exception as e:
-                    st.error(f"プレビューエラー: {str(e)}")
-            
-            # インポートボタン
-            if st.sidebar.button("インポート実行", type="primary"):
-                with st.spinner("インポート中..."):
-                    success, message = import_from_json(json_content, oid)
-                    
-                    if success:
-                        st.sidebar.success(message)
-                        # セッション状態をリセットして新しいチャット一覧を表示
-                        time.sleep(1)  # ユーザーが成功メッセージを見る時間を与える
-                        st.rerun()
-                    else:
-                        st.sidebar.error(message)
-
+    # 履歴格納数調整
+    MAXHISTORY = int(max_tokens_value / 100)
+    if( MAXHISTORY < 100 ):
+        MAXHISTORY = 100
+    if( len(st.session_state.messages) > MAXHISTORY ):
+        st.session_state.messages = st.session_state.messages[-MAXHISTORY:]
 
     # チャット履歴表示
     for message in st.session_state.messages:
@@ -512,7 +552,7 @@ else :
         if(hasMovie ) :
             MEDIA_FORMAT = MEDIA_FORMAT + ["mp4", "mpeg", "mov", "avi", "flv", "mpg", "webm", "wmv", "3gp"]
         if(hasImage ) :
-            MEDIA_FORMAT = MEDIA_FORMAT + ["png", "jpeg", "jpg"]
+            MEDIA_FORMAT = MEDIA_FORMAT + ["png", "jpeg", "jpg", "webp"]
         if(hasAudio ) :
             MEDIA_FORMAT = MEDIA_FORMAT + ["wav", "mp3", "aiff", "aac", "ogg", "flac"]
             
@@ -534,17 +574,18 @@ else :
                     if file.type.startswith("image/"):
                         st.image(file)
                     elif file.type.startswith("video/"):
-                        None
+                        st.video(file)
                     elif file.type.startswith("audio/"):
-                        None
+                        st.audio(file)
 
         with st.chat_message("assistant"):
             with st.spinner("思考中..."):
 
-                wrap_prompt = prompt 
-
+                #チャットリクエスト作成
                 chat_request = None
                 if selected_model.vendor == 'cohere':
+
+                    wrap_prompt = prompt + "\n" + "出力形式:markdown"
 
                     #過去履歴作成
                     #cohere用
@@ -559,7 +600,7 @@ else :
                     #cohere用
                     chat_request = CohereChatRequest(
                         api_format= oci.generative_ai_inference.models.BaseChatRequest.API_FORMAT_COHERE,
-                        message=wrap_prompt + "\n" + "出力形式:markdown",
+                        message=wrap_prompt,
                         chat_history=chat_history if chat_history else None,
                         max_tokens=max_tokens_value,
                         temperature=temperature,
@@ -567,11 +608,13 @@ else :
                         is_stream=False
                     )
                 else:
+                    
+                    wrap_prompt = prompt
 
                     #汎用
                     chat_history = []
                     for message in st.session_state.messages:
-                        # 画像は、1個までのようだ
+                        # Textだけにする
                         msg = Message()
                         msg.role = message.role
                         reqcnts = []
@@ -589,9 +632,9 @@ else :
                     txtcontent.text = wrap_prompt
                     contents.append(txtcontent)
 
-                    # 画像有
+                    # 添付有
                     if hasImage == True and promptattach is not None and len(promptattach.files) > 0:
-                        # 画像ファイル
+                        # 添付ファイル
                         for file in promptattach.files:
                             mime_type = file.type
                             if mime_type.startswith("image/"):
@@ -614,33 +657,57 @@ else :
                     message = Message()
                     message.role = oci.generative_ai_inference.models.Message.ROLE_USER
                     message.content = contents
-
                     chat_history.append(message)
 
-                    chat_final = []
-                    for msg in chat_history:
-                        chat_final.append(msg)
+                    # 外部 URL参照対応
+                    syscontents = []
+                    webimgcontents = []
+                    urls = re.findall(r"https?://\S+", prompt)
+                    for url in urls:
+                        fetcher = fetchmarkdown()
+                        markdowncontent, webimages = fetcher.fetchurl(url)
+                        if markdowncontent is not None :
+                            nowdatestr = datetime.datetime.now(pytz.timezone('Asia/Tokyo')).strftime("%Y-%m-%d %H:%M:%S")
+                            refcontent = TextContent()
+                            refcontent.type = oci.generative_ai_inference.models.TextContent.TYPE_TEXT
+                            refcontent.text = f""" Today is {nowdatestr}.
+{url}
 
-                    # システムメッセージ 追加
+{markdowncontent}"""
+                            syscontents.append(refcontent)
+                            print(f"url:{url}")
+                            
+                        if hasImage == True and webimages is not None :
+                            for webimage in webimages:
+                                webimgcontent = ImageContent()
+                                webimgcontent.type = ImageContent.TYPE_IMAGE
+                                webimgcontent.image_url = webimage
+                                webimgcontents.append(webimgcontent)
+
+                    systxtcontent = TextContent()
+                    systxtcontent.type = oci.generative_ai_inference.models.TextContent.TYPE_TEXT
+                    systxtcontent.text = "Markdown形式で出力して下さい。"
+                    syscontents.append(systxtcontent)
+
                     sysmessage = Message()
                     sysmessage.role = oci.generative_ai_inference.models.Message.ROLE_SYSTEM
-                    syscontents = []
-                    txtcontent = TextContent()
-                    txtcontent.type = oci.generative_ai_inference.models.TextContent.TYPE_TEXT
-                    txtcontent.text = "出力形式:markdown"
-                    syscontents.append(txtcontent)
-
                     sysmessage.content = syscontents
-                    chat_final.append(sysmessage)
+                    chat_history.append(sysmessage)
+
+                    if hasImage == True and len(webimgcontents) > 0 :
+                        webimgmessage = Message()
+                        webimgmessage.role = oci.generative_ai_inference.models.Message.ROLE_USER
+                        webimgmessage.content = webimgcontents
+                        chat_history.append(webimgmessage)
 
                     chat_request = GenericChatRequest(
                         api_format=oci.generative_ai_inference.models.BaseChatRequest.API_FORMAT_GENERIC,
-                        messages=chat_final,
+                        messages=chat_history,
                         max_tokens=max_tokens_value,
                         temperature=temperature
                     )
 
-                #新規メッセージ チャット履歴追加
+                #新規メッセージ チャット履歴追加(cohereと汎用の対応の為、冗長だが、作成しなおす)
                 contents = []
                 txtcontent = TextContent()
                 txtcontent.type = oci.generative_ai_inference.models.TextContent.TYPE_TEXT
@@ -676,10 +743,12 @@ else :
                 newmessage.content = contents
 
                 st.session_state.messages.append(newmessage)
-                # DB チャット履歴追加
-                jstnow = datetime.datetime.now(jst_timezone).strftime('%Y-%m-%d %H時')
-                title = f"{jstnow} {prompt[:20]}"
-                db.save_chat_message(oid, st.session_state.current_chat_session_id, "USER", prompt, title)
+                
+                if oid != 'GUEST':
+                    # DB チャット履歴追加(文字列プロンプトだけ対象)
+                    jstnow = datetime.datetime.now(jst_timezone).strftime('%Y-%m-%d %H時')
+                    title = f"{jstnow} {prompt[:20]}"
+                    db.save_chat_message(oid, st.session_state.current_chat_session_id, "USER", prompt, title)
 
                 # チャット送信処理
                 serving_mode = OnDemandServingMode(model_id=selected_model.id)
@@ -691,67 +760,70 @@ else :
                 response:oci.response.Response = client.chat(chat_details)
                 result:oci.generative_ai_inference.models.ChatResult = response.data
 
-                bot_reply = ""
                 if selected_model.vendor == 'cohere':
                     #cohere用
                     bot_reply = result.chat_response.text
+                    
+                    # 応答 チャット履歴追加
+                    contents = []
+                    txtcontent = TextContent()
+                    txtcontent.type = oci.generative_ai_inference.models.TextContent.TYPE_TEXT
+                    txtcontent.text = bot_reply
+                    contents.append(txtcontent)
 
-                    if bot_reply:
-                        # 応答 チャット履歴追加
-                        contents = []
-                        txtcontent = TextContent()
-                        txtcontent.type = oci.generative_ai_inference.models.TextContent.TYPE_TEXT
-                        txtcontent.text = bot_reply
-                        contents.append(txtcontent)
+                    message = Message()
+                    message.role = oci.generative_ai_inference.models.Message.ROLE_ASSISTANT
+                    message.content = contents
 
-                        message = Message()
-                        message.role = oci.generative_ai_inference.models.Message.ROLE_ASSISTANT
-                        message.content = contents
+                    st.session_state.messages.append(message)
 
-                        st.session_state.messages.append(message)
-
-                        # DB チャット履歴追加
+                    if oid != 'GUEST':
+                        # DB チャット履歴追加(文字列プロンプトだけ対象)
                         db.save_chat_message(oid, st.session_state.current_chat_session_id, "CHATBOT", bot_reply, title)
-                        # 出力
-                        st.markdown(bot_reply)
-
+                    # 出力
+                    st.markdown(bot_reply)
+                    
                 else:
                     #汎用
                     generic_response:oci.generative_ai_inference.models.generic_chat_response.GenericChatResponse = result.chat_response
+                    chatchoice:oci.generative_ai_inference.models.ChatChoice = generic_response.choices[0]
+                    msg:oci.generative_ai_inference.models.Message = chatchoice.message
 
-                    for chatchoice in generic_response.choices:
+                    contents = []
 
-                        msg:oci.generative_ai_inference.models.Message = chatchoice.message
-
-                        for cnt in msg.content:
-                            if isinstance(cnt,oci.generative_ai_inference.models.TextContent):
-                                txt:oci.generative_ai_inference.models.TextContent = cnt
-                                bot_reply = txt.text
-                            elif isinstance(cnt,oci.generative_ai_inference.models.ImageContent):
-                                img:oci.generative_ai_inference.models.ImageContent = cnt
-                                bot_reply = img.image_url
-                            elif isinstance(cnt,oci.generative_ai_inference.models.AudioContent):
-                                audio:oci.generative_ai_inference.models.AudioContent = cnt
-                                bot_reply = audio.audio_url
-                            elif isinstance(cnt,oci.generative_ai_inference.models.VideoContent):
-                                video:oci.generative_ai_inference.models.VideoContent = cnt
-                                bot_reply = video.video_url
-
-                        if bot_reply:
+                    for cnt in msg.content:
+                        if isinstance(cnt,oci.generative_ai_inference.models.TextContent):
+                            txt:oci.generative_ai_inference.models.TextContent = cnt
+                            bot_reply = txt.text
+                            
                             # 応答 チャット履歴追加
-                            contents = []
-                            txtcontent = TextContent()
-                            txtcontent.type = oci.generative_ai_inference.models.TextContent.TYPE_TEXT
-                            txtcontent.text = bot_reply
-                            contents.append(txtcontent)
+                            contents.append(txt)
 
-                            message = Message()
-                            message.role = oci.generative_ai_inference.models.Message.ROLE_ASSISTANT
-                            message.content = contents
-
-                            st.session_state.messages.append(message)
-
-                            # DB チャット履歴追加
-                            db.save_chat_message(oid, st.session_state.current_chat_session_id, "CHATBOT", bot_reply, title)
+                            if oid != 'GUEST':
+                                # DB チャット履歴追加(今のとこ、テキストのみ対応)
+                                db.save_chat_message(oid, st.session_state.current_chat_session_id, "CHATBOT", bot_reply, title)
                             # 出力
                             st.markdown(bot_reply)
+                            
+                        elif isinstance(cnt,oci.generative_ai_inference.models.ImageContent):
+                            img:oci.generative_ai_inference.models.ImageContent = cnt
+                            bot_reply:ImageUrl = img.image_url
+
+                            # 応答 チャット履歴追加
+                            contents.append(img)
+                            
+                            base64image = bot_reply.url.split('base64,')[1]
+                            st.image(base64.b64decode(base64image))
+                            
+                        elif isinstance(cnt,oci.generative_ai_inference.models.AudioContent):
+                            audio:oci.generative_ai_inference.models.AudioContent = cnt
+                            bot_reply = audio.audio_url
+                        elif isinstance(cnt,oci.generative_ai_inference.models.VideoContent):
+                            video:oci.generative_ai_inference.models.VideoContent = cnt
+                            bot_reply = video.video_url
+
+                    message = Message()
+                    message.role = oci.generative_ai_inference.models.Message.ROLE_ASSISTANT
+                    message.content = contents
+
+                    st.session_state.messages.append(message)
