@@ -25,26 +25,29 @@ import pytz
 import hashlib
 import json
 import os
+import io
 import re
 from pathlib import Path
 
 from chatdb import chatdb
 from fetchmarkdown import fetchmarkdown
+from pdf2image import convert_from_bytes
 
 #
 # 定義サンプル
 #
 # .streamlit/secrets.toml
-# [oci]
 # DEBUGMODE="False"
-# CONFIG_PATH="~/.oci/config"
-# CONFIG="DEFAULT"
-# COMPARTMENT_ID="ocid1.compartment.oc1..aaaaaaahogehoge"
+# OCI_CONFIG_PATH="~/.oci/config"
+# OCI_CONFIG="DEFAULT"
+# OCI_COMPARTMENT_ID="ocid1.compartment.oc1..aaaaaaahogehoge"
 # CHAT_HISTORY_TABLENAME="ChatHistory2"
 #
 
 # テーマの取得
 theme = "dark" if st.config.get_option("theme.base") == "dark" else "light"
+
+TITLE = "AI Chat V.4.9"
 
 # モバイル表示の問題を修正
 # テーマに応じたCSSを適用
@@ -319,7 +322,7 @@ for model in models.items:
 BASE_DIR = Path(__file__).resolve().parent
 
 #タイトル
-st.title("AI Chat V.4.8")
+st.title(TITLE)
 
 # セッション切れ対策
 st_autorefresh(interval=1000*60*10, limit=None, key="heartbeat")
@@ -552,7 +555,7 @@ else :
         if(hasMovie ) :
             MEDIA_FORMAT = MEDIA_FORMAT + ["mp4", "mpeg", "mov", "avi", "flv", "mpg", "webm", "wmv", "3gp"]
         if(hasImage ) :
-            MEDIA_FORMAT = MEDIA_FORMAT + ["png", "jpeg", "jpg", "webp"]
+            MEDIA_FORMAT = MEDIA_FORMAT + ["png", "jpeg", "jpg", "webp", "pdf"]
         if(hasAudio ) :
             MEDIA_FORMAT = MEDIA_FORMAT + ["wav", "mp3", "aiff", "aac", "ogg", "flac"]
             
@@ -571,7 +574,12 @@ else :
                 # メディアファイル
                 for file in promptattach.files:
                     print(f"{file.name},{file.type}")
-                    if file.type.startswith("image/"):
+                    if file.type == "application/pdf":
+                        images = convert_from_bytes(file.read(), dpi=120, first_page=1, last_page=50)
+                        st.write(f"全 {len(images)} ページを処理中...")
+                        for img in images:
+                            st.image(img)
+                    elif file.type.startswith("image/"):
                         st.image(file)
                     elif file.type.startswith("video/"):
                         st.video(file)
@@ -719,7 +727,19 @@ else :
                     # 画像ファイル
                     for file in promptattach.files:
                         mime_type = file.type
-                        if mime_type.startswith("image/"):
+                        if mime_type == 'application/pdf' :
+                            pdfimages = convert_from_bytes(file.getvalue(), dpi=120, first_page=1, last_page=50)
+                            for img in pdfimages:
+                                buffered = io.BytesIO()
+                                img.save(buffered, format="JPEG", quality=85)
+                                imgcontent = ImageContent()
+                                imgcontent.type = ImageContent.TYPE_IMAGE
+                                base64_image = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                                imgcontent.image_url = ImageUrl( url = f"data:image/jpeg;base64,"+base64_image )
+                                contents.append(imgcontent)
+                                buffered.close()
+                                print(f"PDFページを画像に変換: {base64_image[:30]}...")
+                        elif mime_type.startswith("image/"):
                             imgcontent = ImageContent()
                             imgcontent.type = ImageContent.TYPE_IMAGE
                             base64_image = base64.b64encode(file.getvalue()).decode("utf-8")
